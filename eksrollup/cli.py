@@ -146,120 +146,119 @@ def scale_up_asg(cluster_name, asg, count):
 def update_asgs(asgs, cluster_name):
     run_mode = app_config['RUN_MODE']
     use_asg_termination_policy = app_config['ASG_USE_TERMINATION_POLICY']
+    batch_size = app_config.get('ROLLOUT_BATCH_SIZE', None)  # e.g. 3 or None
 
+    # pick your planner
     if run_mode == 4:
-        asg_outdated_instance_dict = plan_asgs_older_nodes(asgs)
-
+        asg_outdated = plan_asgs_older_nodes(asgs)
     else:
-        asg_outdated_instance_dict = plan_asgs(asgs)
-
-    asg_state_dict = {}
-
-    if run_mode == 2:
-        # Scale up all the ASGs with outdated nodes (by the number of outdated nodes)
-        for asg_name, asg_tuple in asg_outdated_instance_dict.items():
-            outdated_instances, asg = asg_tuple
-            outdated_instance_count = len(outdated_instances)
-            logger.info(
-                f'Setting the scale of ASG {asg_name} based on {outdated_instance_count} outdated instances.')
-            asg_state_dict[asg_name] = scale_up_asg(cluster_name, asg, outdated_instance_count)
+        asg_outdated = plan_asgs(asgs)
 
     k8s_nodes, k8s_excluded_nodes = get_k8s_nodes()
-    if (run_mode == 2) or (run_mode == 3):
-        for asg_name, asg_tuple in asg_outdated_instance_dict.items():
-            outdated_instances, asg = asg_tuple
-            for outdated in outdated_instances:
-                node_name = ""
-                try:
-                    # get the k8s node name instead of instance id
-                    node_name = get_node_by_instance_id(k8s_nodes, outdated['InstanceId'])
-                    if not app_config["TAINT_NODES"]:
-                        cordon_node(node_name)
-                    else:
-                        taint_node(node_name)
-                except Exception as exception:
-                    logger.error(f"Encountered an error when adding taint/cordoning node {node_name}")
-                    logger.error(exception)
-                    exit(1)
+    asg_state = {}
 
-    # Drain, Delete and Terminate the outdated nodes and return the ASGs back to their original state
-    for asg_name, asg_tuple in asg_outdated_instance_dict.items():
-        outdated_instances, asg = asg_tuple
-        outdated_instance_count = len(outdated_instances)
+    for asg_name, (outdated_instances, asg_obj) in asg_outdated.items():
+        total = len(outdated_instances)
+        if total == 0:
+            continue
 
-        if (run_mode == 1) or (run_mode == 3) or (run_mode == 4):
-            logger.info(
-                f'Setting the scale of ASG {asg_name} based on {outdated_instance_count} outdated instances.')
-            asg_state_dict[asg_name] = scale_up_asg(cluster_name, asg, outdated_instance_count)
+        # how many at a time?
+        bs = batch_size or total
 
-        if (run_mode == 1) or (run_mode == 4):
-            for outdated in outdated_instances:
-                node_name = ""
-                try:
-                    # get the k8s node name instead of instance id
-                    node_name = get_node_by_instance_id(k8s_nodes, outdated['InstanceId'])
-                    if not app_config["TAINT_NODES"]:
-                        cordon_node(node_name)
-                    else:
-                        taint_node(node_name)
-                except Exception as exception:
-                    try:
-                        node_name = get_node_by_instance_id(k8s_excluded_nodes, outdated['InstanceId'])
-                        logger.info(f"Node {node_name} was excluded")
-                        continue
-                    except Exception as exception:
-                        logger.error(f"Encountered an error when adding taint/cordoning node {node_name}")
-                        logger.error(exception)
-                        exit(1)
+        # 1) SCALE UP ONCE by batch-size for head-room
+        logger.info(f'Scaling ASG {asg_name} up by {bs} for batch head-room')
+        new_desired, orig_desired, orig_max = scale_up_asg(cluster_name, asg_obj, bs)
+        asg_state[asg_name] = (new_desired, orig_desired, orig_max)
 
-        if len(outdated_instances) != 0:
-            # if ASG termination is ignored then suspend 'Launch' and 'ReplaceUnhealthy'
-            # for this ASG to avoid instances being spawned during terminate/detach phase
-            if not use_asg_termination_policy:
-                modify_aws_autoscaling(asg_name, "suspend")
+        # save original state tags if your scale_up_asg doesn’t already do it
+        save_asg_tags(asg_name, app_config["ASG_DESIRED_STATE_TAG"], new_desired)
+        save_asg_tags(asg_name, app_config["ASG_ORIG_CAPACITY_TAG"], orig_desired)
+        save_asg_tags(asg_name, app_config["ASG_ORIG_MAX_CAPACITY_TAG"], orig_max)
 
-        # start draining and terminating
-        desired_asg_capacity = asg_state_dict[asg_name][0]
-        for outdated in outdated_instances:
-            # catch any failures so we can resume aws autoscaling
-            try:
-                # get the k8s node name instead of instance id
-                node_name = get_node_by_instance_id(k8s_nodes, outdated['InstanceId'])
-                desired_asg_capacity -= 1
-                drain_node(node_name)
-                delete_node(node_name)
-                save_asg_tags(asg_name, app_config["ASG_DESIRED_STATE_TAG"], desired_asg_capacity)
-                # terminate/detach outdated instances only if ASG termination policy is ignored
-                if not use_asg_termination_policy:
-                    terminate_instance_in_asg(outdated['InstanceId'])
-                    if not instance_terminated(outdated['InstanceId']):
-                        raise Exception('Instance is failing to terminate. Cancelling out.')
-
-                    between_nodes_wait = app_config['BETWEEN_NODES_WAIT']
-                    if between_nodes_wait != 0:
-                        logger.info(f'Waiting for {between_nodes_wait} seconds before continuing...')
-                        time.sleep(between_nodes_wait)
-            except Exception as drain_exception:
-                try:
-                    node_name = get_node_by_instance_id(k8s_excluded_nodes, outdated['InstanceId'])
-                    logger.info(f"Node {node_name} was excluded")
-                    continue
-                except:
-                    raise RollingUpdateException("Rolling update on ASG failed", asg_name)
-
-        # scaling cluster back down
-        logger.info("Scaling asg back down to original state")
-        asg_desired_capacity, asg_orig_desired_capacity, asg_orig_max_capacity = asg_state_dict[asg_name]
-        scale_asg(asg_name, asg_desired_capacity, asg_orig_desired_capacity, asg_orig_max_capacity)
-        # resume aws autoscaling only if ASG termination policy is ignored
+        # suspend AWS’s own launch/replace if you’re doing manual termination
         if not use_asg_termination_policy:
-            modify_aws_autoscaling(asg_name, "resume")
-        # remove aws tag
+            modify_aws_autoscaling(asg_name, 'suspend')
+
+        # 2) process in batches
+        remaining = list(outdated_instances)
+        while remaining:
+            batch = remaining[:bs]
+            remaining = remaining[bs:]
+
+            # a) cordon/taint for RUN_MODE 2 & 3
+            if run_mode in (2, 3):
+                for inst in batch:
+                    node = get_node_by_instance_id(k8s_nodes, inst['InstanceId'])
+                    if app_config.get("TAINT_NODES"):
+                        taint_node(node)
+                    else:
+                        cordon_node(node)
+
+            # b) cordon/taint for RUN_MODE 1 & 4 (with excluded‐node fallback)
+            if run_mode in (1, 4):
+                for inst in batch:
+                    try:
+                        node = get_node_by_instance_id(k8s_nodes, inst['InstanceId'])
+                    except Exception:
+                        # maybe it was already excluded?
+                        node = get_node_by_instance_id(k8s_excluded_nodes, inst['InstanceId'])
+                        logger.info(f"Node {node} was excluded")
+                        continue
+
+                    if app_config.get("TAINT_NODES"):
+                        taint_node(node)
+                    else:
+                        cordon_node(node)
+
+            # c) drain & terminate for RUN_MODE 1,3,4
+            if run_mode in (1, 3, 4):
+                desired_cap, od, om = asg_state[asg_name]
+                for inst in batch:
+                    try:
+                        node = get_node_by_instance_id(k8s_nodes, inst['InstanceId'])
+                    except Exception:
+                        node = get_node_by_instance_id(k8s_excluded_nodes, inst['InstanceId'])
+                        logger.info(f"Node {node} was excluded")
+                        continue
+
+                    drain_node(node)
+                    delete_node(node)
+
+                    # decrement and re-save the DESIRED_STATE tag
+                    # desired_cap -= 1
+                    save_asg_tags(asg_name, app_config["ASG_DESIRED_STATE_TAG"], desired_cap)
+
+                    if not use_asg_termination_policy:
+                        terminate_instance_in_asg(inst['InstanceId'])
+                        if not instance_terminated(inst['InstanceId']):
+                            raise Exception("Instance failed to terminate")
+                        wait = app_config.get('BETWEEN_NODES_WAIT', 0)
+                        if wait:
+                            time.sleep(wait)
+
+                # update our in-memory state so the final scale_asg is correct
+                asg_state[asg_name] = (desired_cap, od, om)
+
+            logger.info(f'Processed batch of {len(batch)} nodes for ASG {asg_name}')
+
+        # 3) SCALE BACK ONCE to original desired/max
+        new_d, orig_d, orig_m = asg_state[asg_name]
+        logger.info(f'Scaling ASG {asg_name} back to original desired {orig_d}')
+        scale_asg(asg_name, new_d, orig_d, orig_m)
+
+        # 4) resume AWS policies
+        if not use_asg_termination_policy:
+            modify_aws_autoscaling(asg_name, 'resume')
+
+        # 5) clean up all tags
         delete_asg_tags(asg_name, app_config["ASG_DESIRED_STATE_TAG"])
         delete_asg_tags(asg_name, app_config["ASG_ORIG_CAPACITY_TAG"])
         delete_asg_tags(asg_name, app_config["ASG_ORIG_MAX_CAPACITY_TAG"])
-        logger.info(f'*** Rolling update of asg {asg_name} is complete! ***')
-    logger.info('All asgs processed')
+
+        logger.info(f'*** Completed rolling update for ASG {asg_name} ***')
+
+    logger.info('All ASGs processed')
+
 
 
 def main(args=None):
